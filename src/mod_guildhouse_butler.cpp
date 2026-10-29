@@ -15,7 +15,7 @@
 #include "CreatureAI.h"
 #include "guildhouse.h"
 
-int cost, GuildHouseInnKeeper, GuildHouseBank, GuildHouseMailBox, GuildHouseAuctioneer, GuildHouseTrainer, GuildHouseVendor, GuildHouseObject, GuildHousePortal, GuildHouseSpirit, GuildHouseProf, GuildHouseBuyRank;
+int GuildHouseInnKeeper, GuildHouseBank, GuildHouseMailBox, GuildHouseAuctioneer, GuildHouseTrainer, GuildHouseVendor, GuildHouseObject, GuildHousePortal, GuildHouseSpirit, GuildHouseProf, GuildHouseBuyRank;
 
 class GuildHouseSpawner : public CreatureScript
 {
@@ -38,22 +38,21 @@ public:
         return new GuildHouseSpawnerAI(creature);
     }
 
+    bool CanUseButler(Player* player, Creature* creature)
+    {
+        Guild* guild = player->GetGuild();
+        Guild::Member const* member = guild ? guild->GetMember(player->GetGUID()) : nullptr;
+        return member && GuildHouseBuyRank >= 0 && GuildHouseBuyRank <= 255 &&
+            member->IsRankNotLower(uint8(GuildHouseBuyRank)) && IsInOwnedGuildHouse(player) &&
+            creature->GetEntry() == GetCreatureEntry(1) && creature->GetMapId() == player->GetMapId() &&
+            creature->GetPhaseMask() == player->GetPhaseMask();
+    }
+
     bool OnGossipHello(Player* player, Creature* creature) override
     {
-        if (player->GetGuild())
+        if (!CanUseButler(player, creature))
         {
-            Guild* guild = sGuildMgr->GetGuildById(player->GetGuildId());
-            Guild::Member const* memberMe = guild->GetMember(player->GetGUID());
-
-            if (!memberMe->IsRankNotLower(GuildHouseBuyRank))
-            {
-                ChatHandler(player->GetSession()).PSendSysMessage("%s", GetGuildHouseLocaleText(GUILDHOUSE_TEXT_NOT_AUTHORIZED_PURCHASE, player).c_str());
-                return false;
-            }
-        }
-        else
-        {
-            ChatHandler(player->GetSession()).PSendSysMessage("%s", GetGuildHouseLocaleText(GUILDHOUSE_TEXT_NOT_IN_GUILD, player).c_str());
+            CloseGossipMenuFor(player);
             return false;
         }
 
@@ -76,6 +75,11 @@ public:
 
     bool OnGossipSelect(Player* player, Creature* creature, uint32 /*sender*/, uint32 action) override
     {
+        if (!CanUseButler(player, creature))
+        {
+            CloseGossipMenuFor(player);
+            return true;
+        }
 
         switch (action)
         {
@@ -138,12 +142,11 @@ public:
         {
             uint32 auctioneer = 0;
             auctioneer = player->GetTeamId() == TEAM_ALLIANCE ? 8719 : 9856;
-            SpawnNPC(auctioneer, player);
+            SpawnNPC(auctioneer, player, GuildHouseAuctioneer);
             break;
         }
         case 9858: // Neutral Auctioneer
-            cost = GuildHouseAuctioneer;
-            SpawnNPC(action, player);
+            SpawnNPC(action, player, GuildHouseAuctioneer);
             break;
         case 7: // Spawn Profession Trainers
             ClearGossipMenuFor(player);
@@ -185,15 +188,11 @@ public:
         case 9: // Go back!
             OnGossipHello(player, creature);
             break;
-        case 10: // PVP toggle
-            break;
         case 30605: // Banker
-            cost = GuildHouseBank;
-            SpawnNPC(action, player);
+            SpawnNPC(action, player, GuildHouseBank);
             break;
         case GetCreatureEntry(2): // Innkeeper
-            cost = GuildHouseInnKeeper;
-            SpawnNPC(action, player);
+            SpawnNPC(action, player, GuildHouseInnKeeper);
             break;
         case 26327: // Paladin
         case 26324: // Druid
@@ -205,8 +204,7 @@ public:
         case 26331: // Warlock
         case 26332: // Warrior
         case 29195: // Death Knight
-            cost = GuildHouseTrainer;
-            SpawnNPC(action, player);
+            SpawnNPC(action, player, GuildHouseTrainer);
             break;
         case 2836:  // Blacksmithing
         case 8128:  // Mining
@@ -225,8 +223,7 @@ public:
         case 19185: // Cooking
         case 2834:  // Fishing
         case 19184: // First Aid
-            cost = GuildHouseProf;
-            SpawnNPC(action, player);
+            SpawnNPC(action, player, GuildHouseProf);
             break;
         case 28692: // Trade Supplies
         case 28776: // Tabard Vendor
@@ -235,26 +232,22 @@ public:
         case 29493: // Ammo & Repair Vendor
         case 28690: // Stable Master
         case 2622:  // Poisons Vendor
-            cost = GuildHouseVendor;
-            SpawnNPC(action, player);
+            SpawnNPC(action, player, GuildHouseVendor);
             break;
         //
         // Objects
         //
         case 184137: // Mailbox
-            cost = GuildHouseMailBox;
-            SpawnObject(action, player);
+            SpawnObject(action, player, GuildHouseMailBox);
             break;
         case 6491: // Spirit Healer
-            cost = GuildHouseSpirit;
-            SpawnNPC(action, player);
+            SpawnNPC(action, player, GuildHouseSpirit);
             break;
         case 1685:   // Forge
         case 4087:   // Anvil
         case 187293: // Guild Vault
         case 191028: // Barber Chair
-            cost = GuildHouseObject;
-            SpawnObject(action, player);
+            SpawnObject(action, player, GuildHouseObject);
             break;
         case GetGameObjectEntry(1): // Darnassus Portal
         case GetGameObjectEntry(2): // Exodar Portal
@@ -264,8 +257,10 @@ public:
         case GetGameObjectEntry(7): // Undercity Portal
         case GetGameObjectEntry(8): // Shattrath Portal
         case GetGameObjectEntry(9): // Dalaran Portal
-            cost = GuildHousePortal;
-            SpawnObject(action, player);
+            SpawnObject(action, player, GuildHousePortal);
+            break;
+        default:
+            CloseGossipMenuFor(player);
             break;
         }
         return true;
@@ -276,8 +271,14 @@ public:
         return player->GetGuildId() + 10;
     }
 
-    void SpawnNPC(uint32 entry, Player* player)
+    void SpawnNPC(uint32 entry, Player* player, int32 cost)
     {
+        if (cost < 0 || !player->HasEnoughMoney(cost))
+        {
+            CloseGossipMenuFor(player);
+            return;
+        }
+
         if (player->FindNearestCreature(entry, VISIBILITY_RANGE, true))
         {
             ChatHandler(player->GetSession()).PSendSysMessage("You already have this creature!");
@@ -321,6 +322,7 @@ public:
         if (!creature->LoadCreatureFromDB(db_guid, player->GetMap()))
         {
             delete creature;
+            RollbackGuildHouseSpawn(player->GetMap(), db_guid, false);
             return;
         }
 
@@ -329,8 +331,14 @@ public:
         CloseGossipMenuFor(player);
     }
 
-    void SpawnObject(uint32 entry, Player* player)
+    void SpawnObject(uint32 entry, Player* player, int32 cost)
     {
+        if (cost < 0 || !player->HasEnoughMoney(cost))
+        {
+            CloseGossipMenuFor(player);
+            return;
+        }
+
         if (player->FindNearestGameObject(entry, VISIBLE_RANGE))
         {
             ChatHandler(player->GetSession()).PSendSysMessage("%s", GetGuildHouseLocaleText(GUILDHOUSE_TEXT_OBJECT_ALREADY_EXISTS, player).c_str());
@@ -391,6 +399,7 @@ public:
         if (!object->LoadGameObjectFromDB(guidLow, player->GetMap(), true))
         {
             delete object;
+            RollbackGuildHouseSpawn(player->GetMap(), guidLow, true);
             return;
         }
 
