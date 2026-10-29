@@ -15,10 +15,13 @@
 #include "Transport.h"
 #include "Maps/MapMgr.h"
 #include "WorldSession.h"
+#include "World.h"
 #include "DatabaseEnv.h"
 #include "guildhouse.h"
 #include <array>
 #include <unordered_map>
+#include <vector>
+#include <utility>
 
 namespace
 {
@@ -73,11 +76,235 @@ public:
     GuildData() {}
     GuildData(uint32 phase, float posX, float posY, float posZ, float ori) : phase(phase), posX(posX), posY(posY), posZ(posZ), ori(ori) {}
     uint32 phase;
+    uint32 menuGuildId = 0;
     float posX;
     float posY;
     float posZ;
     float ori;
 };
+
+bool IsInOwnedGuildHouse(Player* player)
+{
+    if (!player->GetGuild() || player->GetMapId() != 1 || player->GetZoneId() != 876 || player->GetAreaId() != 876)
+        return false;
+    QueryResult house = CharacterDatabase.Query("SELECT phase, map FROM guild_house WHERE guild={}", player->GetGuildId());
+    return house && house->Fetch()[0].Get<uint32>() == player->GetGuildId() + 10 &&
+        house->Fetch()[1].Get<uint32>() == 1 && player->GetPhaseMask() == player->GetGuildId() + 10;
+}
+
+static bool IsGuildHouseServiceEntry(uint32 entry, bool object)
+{
+    if (object)
+        return (entry >= GetGameObjectEntry(0) && entry <= GetGameObjectEntry(9)) ||
+            entry == 1685 || entry == 4087 || entry == 187293 || entry == 191028 || entry == 184137;
+    switch (entry)
+    {
+        case 908: case 2622: case 2627: case 2834: case 2836: case 6491: case 8128:
+        case 8719: case 8736: case 9856: case 9858: case 18751: case 18753: case 18773:
+        case 18774: case 19052: case 19180: case 19184: case 19185: case 19187: case 19572:
+        case 26324: case 26325: case 26326: case 26327: case 26328: case 26329: case 26330:
+        case 26331: case 26332: case 28690: case 28692: case 28776: case 29195: case 29493:
+        case 29636: case 30605: case 30721: case 30722:
+        case GetCreatureEntry(1): case GetCreatureEntry(2):
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool MatchesGuildHouseSpawn(SpawnData const* data, uint32 entry, bool object, uint32 phase,
+    Field* fields, std::unordered_map<uint32, std::array<float, 4>> const& positions)
+{
+    if (!data || !data->dbData || data->mapid != 1 || data->phaseMask != phase ||
+        fields[2].Get<uint32>() != 1 || fields[3].Get<uint32>() != phase || !IsGuildHouseServiceEntry(entry, object))
+        return false;
+    std::array<float, 4> expected;
+    auto pos = positions.find(entry);
+    if (!object && entry == GetCreatureEntry(1))
+        expected = {16202.185547f, 16255.916992f, 21.160221f, 6.195375f};
+    else if (pos != positions.end())
+        expected = pos->second;
+    else
+        return false;
+    return expected == std::array<float, 4>{data->posX, data->posY, data->posZ, data->orientation} &&
+        expected == std::array<float, 4>{fields[4].Get<float>(), fields[5].Get<float>(), fields[6].Get<float>(), fields[7].Get<float>()};
+}
+
+static void AppendGuildHouseSpawnDelete(WorldDatabaseTransaction& trans, uint32 spawnId, bool object)
+{
+    // Native WORLD_DEL_* prepared statements are async-only. The same trusted,
+    // exact-ID SQL works for queued rollback and synchronous cleanup receipts.
+    if (object)
+    {
+        trans->Append("DELETE FROM gameobject WHERE guid = {}", spawnId);
+        trans->Append("DELETE FROM game_event_gameobject WHERE guid = {}", spawnId);
+    }
+    else
+    {
+        trans->Append("DELETE FROM creature WHERE guid = {}", spawnId);
+        trans->Append("DELETE FROM creature_addon WHERE guid = {}", spawnId);
+        trans->Append("DELETE FROM creature_multispawn WHERE spawnId = {}", spawnId);
+        trans->Append("DELETE FROM game_event_creature WHERE guid = {}", spawnId);
+        trans->Append("DELETE FROM game_event_model_equip WHERE guid = {}", spawnId);
+    }
+}
+
+void RollbackGuildHouseSpawn(Map* map, uint32 spawnId, bool object)
+{
+    // Only the new ID allocated by this purchase is eligible. Queue its deletion
+    // after native SaveToDB on the realm's single world-database worker.
+    WorldDatabaseTransaction trans = WorldDatabase.BeginTransaction();
+    AppendGuildHouseSpawnDelete(trans, spawnId, object);
+    WorldDatabase.CommitTransaction(trans);
+    if (object)
+    {
+        map->RemoveGORespawnTime(spawnId);
+        sObjectMgr->DeleteGOData(spawnId);
+    }
+    else
+    {
+        map->RemoveCreatureRespawnTime(spawnId);
+        sObjectMgr->DeleteCreatureData(spawnId);
+    }
+}
+
+bool RemoveOwnedGuildHouse(uint32 guildId)
+{
+    QueryResult house = CharacterDatabase.Query("SELECT phase, map FROM guild_house WHERE guild={}", guildId);
+    uint32 phase = guildId + 10;
+    if (!house || house->Fetch()[0].Get<uint32>() != phase || house->Fetch()[1].Get<uint32>() != 1)
+        return false;
+
+    std::unordered_map<uint32, std::array<float, 4>> positions;
+    QueryResult rows = WorldDatabase.Query("SELECT entry, posX, posY, posZ, orientation FROM guild_house_spawns");
+    if (!rows)
+        return false;
+    do
+    {
+        Field* fields = rows->Fetch();
+        positions[fields[0].Get<uint32>()] = {fields[1].Get<float>(), fields[2].Get<float>(), fields[3].Get<float>(), fields[4].Get<float>()};
+    } while (rows->NextRow());
+
+    Map* map = sMapMgr->FindMap(1, 0);
+    WorldDatabaseTransaction trans = WorldDatabase.BeginTransaction();
+    std::array<std::string, 2> deletedIds;
+    std::array<std::vector<std::pair<uint32, uint32>>, 2> owned;
+    for (uint8 object = 0; object < 2; ++object)
+    {
+        rows = WorldDatabase.Query("SELECT COUNT(*) FROM {} WHERE map=1 AND phaseMask={}", object ? "gameobject" : "creature", phase);
+        if (!rows)
+            return false;
+        if (!rows->Fetch()[0].Get<uint32>())
+            continue;
+        rows = WorldDatabase.Query("SELECT guid, id, map, phaseMask, position_x, position_y, position_z, orientation FROM {} WHERE map=1 AND phaseMask={}",
+            object ? "gameobject" : "creature", phase);
+        if (!rows)
+            return false;
+        do
+        {
+            Field* fields = rows->Fetch();
+            uint32 guid = fields[0].Get<uint32>();
+            uint32 entry = fields[1].Get<uint32>();
+            SpawnData const* data = object ? static_cast<SpawnData const*>(sObjectMgr->GetGameObjectData(guid)) :
+                static_cast<SpawnData const*>(sObjectMgr->GetCreatureData(guid));
+            if (!MatchesGuildHouseSpawn(data, entry, object, phase, fields, positions))
+                continue;
+            if (object ? sObjectMgr->GetGameObjectData(guid)->id != entry : sObjectMgr->GetCreatureData(guid)->id != entry)
+                continue;
+            bool foreignCopy = false;
+            if (map && object)
+            {
+                auto copies = map->GetGameObjectBySpawnIdStore().equal_range(guid);
+                for (auto itr = copies.first; itr != copies.second; ++itr)
+                    if (itr->second->GetPhaseMask() != phase)
+                        foreignCopy = true;
+            }
+            else if (map)
+            {
+                auto copies = map->GetCreatureBySpawnIdStore().equal_range(guid);
+                for (auto itr = copies.first; itr != copies.second; ++itr)
+                    if (itr->second->GetPhaseMask() != phase)
+                        foreignCopy = true;
+            }
+            if (foreignCopy)
+                continue;
+            AppendGuildHouseSpawnDelete(trans, guid, object);
+            owned[object].emplace_back(guid, entry);
+            if (!deletedIds[object].empty())
+                deletedIds[object] += ',';
+            deletedIds[object] += std::to_string(guid);
+        } while (rows->NextRow());
+    }
+    if (!deletedIds[0].empty() || !deletedIds[1].empty())
+        WorldDatabase.DirectCommitTransaction(trans);
+    for (uint8 object = 0; object < 2; ++object)
+    {
+        if (deletedIds[object].empty())
+            continue;
+        rows = WorldDatabase.Query("SELECT COUNT(*) FROM {} WHERE guid IN ({})", object ? "gameobject" : "creature", deletedIds[object]);
+        if (!rows || rows->Fetch()[0].Get<uint32>() != 0)
+            return false;
+    }
+    // Confirm persistence before changing live actors/cache or issuing a refund.
+    // Loaded native deletion repeats the same idempotent prepared deletes.
+    for (uint8 object = 0; object < 2; ++object)
+        for (auto const& [guid, entry] : owned[object])
+        {
+            if (object)
+            {
+                std::vector<GameObject*> actors;
+                if (map)
+                {
+                    auto copies = map->GetGameObjectBySpawnIdStore().equal_range(guid);
+                    for (auto itr = copies.first; itr != copies.second; ++itr)
+                        actors.push_back(itr->second);
+                }
+                // Cleanup unregisters from the multimap. Snapshot first, and
+                // deactivate every copy while its shared SpawnData is still valid.
+                for (GameObject* actor : actors)
+                {
+                    actor->SetRespawnTime(0);
+                    actor->Delete();
+                    actor->CleanupsBeforeDelete();
+                }
+                if (!actors.empty())
+                    actors.front()->DeleteFromDB();
+                else
+                {
+                    if (map)
+                        map->RemoveGORespawnTime(guid);
+                    sObjectMgr->DeleteGOData(guid);
+                }
+            }
+            else
+            {
+                std::vector<Creature*> actors;
+                if (map)
+                {
+                    auto copies = map->GetCreatureBySpawnIdStore().equal_range(guid);
+                    for (auto itr = copies.first; itr != copies.second; ++itr)
+                        actors.push_back(itr->second);
+                }
+                for (Creature* actor : actors)
+                {
+                    actor->CombatStop();
+                    actor->CleanupsBeforeDelete();
+                    actor->AddObjectToRemoveList();
+                }
+                if (!actors.empty())
+                    actors.front()->DeleteFromDB();
+                else
+                {
+                    if (map)
+                        map->RemoveCreatureRespawnTime(guid);
+                    sObjectMgr->DeleteCreatureData(guid);
+                }
+            }
+        }
+    CharacterDatabase.DirectExecute("DELETE FROM guild_house WHERE guild={} AND phase={} AND map=1", guildId, phase);
+    rows = CharacterDatabase.Query("SELECT COUNT(*) FROM guild_house WHERE guild={}", guildId);
+    return rows && rows->Fetch()[0].Get<uint32>() == 0;
+}
 
 class GuildHelper : public GuildScript
 {
@@ -110,61 +337,7 @@ public:
 
     bool RemoveGuildHouse(Guild* guild)
     {
-        uint32 guildPhase = GetGuildPhase(guild);
-        QueryResult CreatureResult;
-        QueryResult GameobjResult;
-
-        // Lets find all of the gameobjects to be removed
-        GameobjResult = WorldDatabase.Query("SELECT `guid` FROM `gameobject` WHERE `map`=1 AND `phaseMask`={}", guildPhase);
-        // Lets find all of the creatures to be removed
-        CreatureResult = WorldDatabase.Query("SELECT `guid` FROM `creature` WHERE `map`=1 AND `phaseMask`={}", guildPhase);
-
-        Map* map = sMapMgr->FindMap(1, 0);
-        // Remove creatures from the deleted guild house map
-        if (CreatureResult)
-        {
-            do
-            {
-                Field* fields = CreatureResult->Fetch();
-                uint32 lowguid = fields[0].Get<int32>();
-                if (CreatureData const* cr_data = sObjectMgr->GetCreatureData(lowguid))
-                {
-                    if (Creature* creature = map->GetCreature(ObjectGuid::Create<HighGuid::Unit>(cr_data->id, lowguid)))
-                    {
-                        creature->CombatStop();
-                        creature->DeleteFromDB();
-                        creature->AddObjectToRemoveList();
-                    }
-                }
-            } while (CreatureResult->NextRow());
-        }
-
-        // Remove gameobjects from the deleted guild house map
-        if (GameobjResult)
-        {
-            do
-            {
-                Field *fields = GameobjResult->Fetch();
-                uint32 lowguid = fields[0].Get<int32>();
-                if (GameObjectData const* go_data = sObjectMgr->GetGameObjectData(lowguid))
-                {
-                    if (GameObject* gobject = map->GetGameObject(ObjectGuid::Create<HighGuid::GameObject>(go_data->id, lowguid)))
-                    {
-                        gobject->SetRespawnTime(0);
-                        gobject->Delete();
-                        gobject->DeleteFromDB();
-                        gobject->CleanupsBeforeDelete();
-                        // delete gobject;
-                    }
-                }
-
-            } while (GameobjResult->NextRow());
-        }
-
-        // Delete actual guild_house data from characters database
-        CharacterDatabase.Query("DELETE FROM `guild_house` WHERE `guild`={}", guild->GetId());
-
-        return true;
+        return RemoveOwnedGuildHouse(guild->GetId());
     }
 };
 
@@ -198,6 +371,7 @@ public:
             return false;
         }
 
+        player->CustomData.GetDefault<GuildData>("phase")->menuGuildId = player->GetGuildId();
         QueryResult has_gh = CharacterDatabase.Query("SELECT id, `guild` FROM `guild_house` WHERE guild = {}", player->GetGuildId());
 
         // Only show Teleport option if guild owns a guild house
@@ -238,6 +412,12 @@ public:
 
     bool OnGossipSelect(Player* player, Creature* creature, uint32 /*sender*/, uint32 action) override
     {
+        Guild* guild = player->GetGuild();
+        if (!guild || player->CustomData.GetDefault<GuildData>("phase")->menuGuildId != guild->GetId())
+        {
+            CloseGossipMenuFor(player);
+            return true;
+        }
         uint32 map;
         float posX;
         float posY;
@@ -256,11 +436,20 @@ public:
         case 5: // close
             CloseGossipMenuFor(player);
             break;
-        case 4: // --- MORE TO COME ---
-            BuyGuildHouse(player->GetGuild(), player, creature);
-            break;
         case 3: // sell back guild house
         {
+            Guild::Member const* member = guild->GetMember(player->GetGUID());
+            int32 rank = sConfigMgr->GetOption<int32>("GuildHouseSellRank", 0);
+            int32 houseCost = sConfigMgr->GetOption<int32>("CostGuildHouse", 10000000);
+            int32 refund = houseCost / 2;
+            uint32 trialCap = sWorld->getIntConfig(CONFIG_TRIAL_MONEY_CAP);
+            if (!member || rank < 0 || rank > 255 || !member->IsRankNotLower(uint8(rank)) || houseCost < 0 ||
+                (refund && player->GetMoney() >= uint32(MAX_MONEY_AMOUNT - refund)) ||
+                (trialCap && player->GetSession()->IsTrialAccount() && player->GetMoney() + uint32(refund) > trialCap))
+            {
+                CloseGossipMenuFor(player);
+                return true;
+            }
             QueryResult has_gh = CharacterDatabase.Query("SELECT id, `guild` FROM `guild_house` WHERE guild={}", player->GetGuildId());
             if (!has_gh)
             {
@@ -274,7 +463,7 @@ public:
             {
                 ChatHandler(player->GetSession()).PSendSysMessage("%s", GetGuildHouseLocaleText(GUILDHOUSE_TEXT_HOUSE_SOLD_SUCCESS, player).c_str());
                 player->GetGuild()->BroadcastToGuild(player->GetSession(), false, GetGuildHouseLocaleText(GUILDHOUSE_TEXT_BROADCAST_HOUSE_SOLD, player).c_str(), LANG_UNIVERSAL);
-                player->ModifyMoney(+(sConfigMgr->GetOption<int32>("CostGuildHouse", 10000000) / 2));
+                player->ModifyMoney(refund);
                 LOG_INFO("modules", "GUILDHOUSE: Successfully returned money and sold Guild House");
                 CloseGossipMenuFor(player);
             }
@@ -291,12 +480,30 @@ public:
         case 1: // teleport to guild house
             TeleportGuildHouse(player->GetGuild(), player, creature);
             break;
+        default:
+            CloseGossipMenuFor(player);
+            return true;
         }
 
-        if (action >= 100)
+        if (action == 100)
         {
-            CharacterDatabase.Query("INSERT INTO `guild_house` (guild, phase, map, positionX, positionY, positionZ, orientation) VALUES ({}, {}, {}, {}, {}, {}, {})", player->GetGuildId(), GetGuildPhase(player), map, posX, posY, posZ, ori);
-            player->ModifyMoney(-(sConfigMgr->GetOption<int32>("CostGuildHouse", 10000000)));
+            int32 price = sConfigMgr->GetOption<int32>("CostGuildHouse", 10000000);
+            QueryResult existing = CharacterDatabase.Query("SELECT COUNT(*) FROM guild_house WHERE guild={}", guild->GetId());
+            if (guild->GetLeaderGUID() != player->GetGUID() || !existing || existing->Fetch()[0].Get<uint32>() != 0 || price < 0 || !player->HasEnoughMoney(price))
+            {
+                CloseGossipMenuFor(player);
+                return true;
+            }
+            CharacterDatabase.DirectExecute("INSERT INTO `guild_house` (guild, phase, map, positionX, positionY, positionZ, orientation) VALUES ({}, {}, {}, {}, {}, {}, {})", player->GetGuildId(), GetGuildPhase(player), map, posX, posY, posZ, ori);
+            QueryResult saved = CharacterDatabase.Query("SELECT phase, map, positionX, positionY, positionZ, orientation FROM guild_house WHERE guild={}", guild->GetId());
+            if (!saved || saved->Fetch()[0].Get<uint32>() != GetGuildPhase(player) || saved->Fetch()[1].Get<uint32>() != map ||
+                saved->Fetch()[2].Get<float>() != posX || saved->Fetch()[3].Get<float>() != posY ||
+                saved->Fetch()[4].Get<float>() != posZ || saved->Fetch()[5].Get<float>() != ori)
+            {
+                CloseGossipMenuFor(player);
+                return true;
+            }
+            player->ModifyMoney(-price);
             // Msg to purchaser and Msg Guild as purchaser
             ChatHandler(player->GetSession()).PSendSysMessage("%s", GetGuildHouseLocaleText(GUILDHOUSE_TEXT_HOUSE_PURCHASED_SUCCESS, player).c_str());
             player->GetGuild()->BroadcastToGuild(player->GetSession(), false, GetGuildHouseLocaleText(GUILDHOUSE_TEXT_BROADCAST_HOUSE_PURCHASED, player).c_str(), LANG_UNIVERSAL);
@@ -319,61 +526,7 @@ public:
 
     bool RemoveGuildHouse(Player* player)
     {
-
-        uint32 guildPhase = GetGuildPhase(player);
-        QueryResult CreatureResult;
-        QueryResult GameobjResult;
-        Map *map = sMapMgr->FindMap(1, 0);
-        // Lets find all of the gameobjects to be removed
-        GameobjResult = WorldDatabase.Query("SELECT `guid` FROM `gameobject` WHERE `map` = 1 AND `phaseMask` = '{}'", guildPhase);
-        // Lets find all of the creatures to be removed
-        CreatureResult = WorldDatabase.Query("SELECT `guid` FROM `creature` WHERE `map` = 1 AND `phaseMask` = '{}'", guildPhase);
-
-        // Remove creatures from the deleted guild house map
-        if (CreatureResult)
-        {
-            do
-            {
-                Field* fields = CreatureResult->Fetch();
-                uint32 lowguid = fields[0].Get<uint32>();
-                if (CreatureData const* cr_data = sObjectMgr->GetCreatureData(lowguid))
-                {
-                    if (Creature* creature = map->GetCreature(ObjectGuid::Create<HighGuid::Unit>(cr_data->id, lowguid)))
-                    {
-                        creature->CombatStop();
-                        creature->DeleteFromDB();
-                        creature->AddObjectToRemoveList();
-                    }
-                }
-            } while (CreatureResult->NextRow());
-        }
-
-        // Remove gameobjects from the deleted guild house map
-        if (GameobjResult)
-        {
-            do
-            {
-                Field* fields = GameobjResult->Fetch();
-                uint32 lowguid = fields[0].Get<uint32>();
-                if (GameObjectData const* go_data = sObjectMgr->GetGameObjectData(lowguid))
-                {
-                    if (GameObject* gobject = map->GetGameObject(ObjectGuid::Create<HighGuid::GameObject>(go_data->id, lowguid)))
-                    {
-                        gobject->SetRespawnTime(0);
-                        gobject->Delete();
-                        gobject->DeleteFromDB();
-                        gobject->CleanupsBeforeDelete();
-                        // delete gobject;
-                    }
-                }
-
-            } while (GameobjResult->NextRow());
-        }
-
-        // Delete actual guild_house data from characters database
-        CharacterDatabase.Query("DELETE FROM `guild_house` WHERE `guild`={}", player->GetGuildId());
-
-        return true;
+        return RemoveOwnedGuildHouse(player->GetGuildId());
     }
 
     void SpawnStarterPortal(Player* player)
@@ -484,7 +637,7 @@ public:
         Map* map = sMapMgr->FindMap(1, 0);
         Creature *creature = new Creature();
 
-        if (!creature->Create(map->GenerateLowGuid<HighGuid::Unit>(), map, player->GetPhaseMaskForSpawn(), entry, 0, posX, posY, posZ, ori))
+        if (!creature->Create(map->GenerateLowGuid<HighGuid::Unit>(), map, GetGuildPhase(player), entry, 0, posX, posY, posZ, ori))
         {
             delete creature;
             return;
@@ -507,6 +660,11 @@ public:
 
     bool BuyGuildHouse(Guild* guild, Player* player, Creature* creature)
     {
+        if (!guild || guild->GetLeaderGUID() != player->GetGUID())
+        {
+            CloseGossipMenuFor(player);
+            return false;
+        }
         QueryResult result = CharacterDatabase.Query("SELECT `id`, `guild` FROM `guild_house` WHERE `guild`={}", guild->GetId());
 
         if (result)
@@ -516,6 +674,7 @@ public:
             return false;
         }
 
+        player->CustomData.GetDefault<GuildData>("phase")->menuGuildId = guild->GetId();
         ClearGossipMenuFor(player);
         AddGossipItemFor(player, GOSSIP_ICON_MONEY_BAG, GetGuildHouseLocaleText(GUILDHOUSE_TEXT_GOSSIP_GM_ISLAND, player), GOSSIP_SENDER_MAIN, 100, GetGuildHouseLocaleText(GUILDHOUSE_TEXT_CONFIRM_BUY_GM_ISLAND, player), sConfigMgr->GetOption<int32>("CostGuildHouse", 10000000), false);
         // Removing this tease for now, as right now the phasing code is specific go GM Island, so it's not a simple thing to add new areas yet.
@@ -531,6 +690,7 @@ public:
 
         if (!result)
         {
+            guildData->menuGuildId = guild->GetId();
             ClearGossipMenuFor(player);
             if (player->GetGuild()->GetLeaderGUID() == player->GetGUID())
             {

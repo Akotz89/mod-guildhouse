@@ -3,6 +3,12 @@
 
 #include <string>
 
+class Player;
+class Map;
+bool IsInOwnedGuildHouse(Player* player);
+bool RemoveOwnedGuildHouse(uint32 guildId);
+void RollbackGuildHouseSpawn(Map* map, uint32 spawnId, bool object);
+
 // Offsets from creatures_objects.sql
 constexpr uint32 GetCreatureEntry(uint32 offset)
 {
@@ -177,6 +183,7 @@ enum GuildHouseLocaleString : uint32
 };
 
 class Player;
+class Map;
 
 // Preloads localized texts from mod_guildhouse_locale into memory
 void LoadGuildHouseLocales();
